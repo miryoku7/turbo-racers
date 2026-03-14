@@ -256,6 +256,13 @@ canvas#gameCanvas{display:block;position:fixed;top:0;left:0;z-index:0}
 <canvas id="gameCanvas"></canvas>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/FXAAShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
 <script>
 // ============================================================
 // TURBO RACERS - 3D Kart Racing Game
@@ -359,6 +366,8 @@ let countdownTimer = 0;
 let raceTime = 0;
 let shakeIntensity = 0;
 let keys = {};
+let composer, bloomPass, fxaaPass;
+let waterMesh = null;
 
 // ==================== AUDIO ====================
 function initAudio() {
@@ -411,6 +420,24 @@ function initThree() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  renderer.outputEncoding = THREE.sRGBEncoding;
+
+  // Post-processing
+  composer = new THREE.EffectComposer(renderer);
+  const renderPass = new THREE.RenderPass(scene, camera);
+  composer.addPass(renderPass);
+
+  bloomPass = new THREE.UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    0.3, 0.4, 0.85
+  );
+  composer.addPass(bloomPass);
+
+  fxaaPass = new THREE.ShaderPass(THREE.FXAAShader);
+  fxaaPass.uniforms['resolution'].value.set(1 / window.innerWidth, 1 / window.innerHeight);
+  composer.addPass(fxaaPass);
 
   clock = new THREE.Clock();
 
@@ -418,7 +445,116 @@ function initThree() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+    fxaaPass.uniforms['resolution'].value.set(1 / window.innerWidth, 1 / window.innerHeight);
   });
+}
+
+function createGrassTexture(isNight) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512; canvas.height = 512;
+  const ctx = canvas.getContext('2d');
+  const baseR = isNight ? 14 : 50, baseG = isNight ? 32 : 140, baseB = isNight ? 14 : 55;
+  ctx.fillStyle = `rgb(${baseR},${baseG},${baseB})`;
+  ctx.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 8000; i++) {
+    const x = Math.random() * 512, y = Math.random() * 512;
+    const v = Math.floor(Math.random() * 40 - 20);
+    ctx.fillStyle = `rgb(${Math.max(0,baseR+v)},${Math.max(0,baseG+v+Math.floor(Math.random()*15))},${Math.max(0,baseB+v)})`;
+    ctx.fillRect(x, y, 2 + Math.random() * 4, 1 + Math.random() * 3);
+  }
+  for (let i = 0; i < 300; i++) {
+    const x = Math.random() * 512, y = Math.random() * 512;
+    ctx.fillStyle = isNight ? 'rgba(20,15,10,0.4)' : 'rgba(140,120,70,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(x, y, 3 + Math.random() * 8, 2 + Math.random() * 5, Math.random() * Math.PI, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(50, 50);
+  tex.encoding = THREE.sRGBEncoding;
+  return tex;
+}
+
+function createSkyDome(isNight) {
+  const skyGeom = new THREE.SphereGeometry(450, 32, 15);
+  const skyUniforms = {
+    topColor: { value: new THREE.Color(isNight ? 0x000010 : 0x1a3a6a) },
+    bottomColor: { value: new THREE.Color(isNight ? 0x0a0a2e : 0x87ceeb) },
+    offset: { value: 20 },
+    exponent: { value: 0.6 }
+  };
+  const skyMat = new THREE.ShaderMaterial({
+    uniforms: skyUniforms,
+    vertexShader: `varying vec3 vWorldPosition;
+      void main() {
+        vec4 worldPos = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = worldPos.xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `uniform vec3 topColor; uniform vec3 bottomColor;
+      uniform float offset; uniform float exponent;
+      varying vec3 vWorldPosition;
+      void main() {
+        float h = normalize(vWorldPosition + offset).y;
+        gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h, 0.0), exponent), 0.0)), 1.0);
+      }`,
+    side: THREE.BackSide,
+    depthWrite: false
+  });
+  const sky = new THREE.Mesh(skyGeom, skyMat);
+  scene.add(sky);
+
+  if (isNight) {
+    const starVerts = [];
+    for (let i = 0; i < 500; i++) {
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(Math.random() * 0.8 + 0.2);
+      const r = 440;
+      starVerts.push(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
+    }
+    const starGeom = new THREE.BufferGeometry();
+    starGeom.setAttribute('position', new THREE.Float32BufferAttribute(starVerts, 3));
+    const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, sizeAttenuation: true });
+    scene.add(new THREE.Points(starGeom, starMat));
+  } else {
+    // Sun sprite
+    const sunCanvas = document.createElement('canvas');
+    sunCanvas.width = 128; sunCanvas.height = 128;
+    const sctx = sunCanvas.getContext('2d');
+    const grad = sctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(255,255,220,1)');
+    grad.addColorStop(0.2, 'rgba(255,240,180,0.9)');
+    grad.addColorStop(0.5, 'rgba(255,200,100,0.3)');
+    grad.addColorStop(1, 'rgba(255,200,100,0)');
+    sctx.fillStyle = grad;
+    sctx.fillRect(0, 0, 128, 128);
+    const sunTex = new THREE.CanvasTexture(sunCanvas);
+    const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: sunTex, transparent: true, blending: THREE.AdditiveBlending }));
+    sunSprite.position.set(50, 80, 30).normalize().multiplyScalar(400);
+    sunSprite.scale.set(60, 60, 1);
+    scene.add(sunSprite);
+  }
+}
+
+function createClouds(isNight) {
+  if (isNight) return;
+  const cloudMat = new THREE.MeshBasicMaterial({
+    color: 0xeeeeff, transparent: true, opacity: 0.7
+  });
+  for (let i = 0; i < 12; i++) {
+    const cloud = new THREE.Group();
+    const numPuffs = 3 + Math.floor(Math.random() * 4);
+    for (let j = 0; j < numPuffs; j++) {
+      const puff = new THREE.Mesh(new THREE.SphereGeometry(5 + Math.random() * 8, 7, 5), cloudMat);
+      puff.position.set((Math.random() - 0.5) * 15, (Math.random() - 0.5) * 3, (Math.random() - 0.5) * 8);
+      puff.scale.y = 0.35 + Math.random() * 0.25;
+      cloud.add(puff);
+    }
+    cloud.position.set((Math.random() - 0.5) * 600, 80 + Math.random() * 40, (Math.random() - 0.5) * 600);
+    scene.add(cloud);
+  }
 }
 
 function setupScene(trackIdx) {
@@ -429,17 +565,21 @@ function setupScene(trackIdx) {
   activeProjectiles = [];
   droppedItems = [];
   particles = [];
+  waterMesh = null;
 
   const isNight = trackIdx === 1;
 
-  // Sky
-  if (isNight) {
-    scene.background = new THREE.Color(0x0a0a1e);
-    scene.fog = new THREE.Fog(0x0a0a1e, 150, 500);
-  } else {
-    scene.background = new THREE.Color(0x87ceeb);
-    scene.fog = new THREE.Fog(0x87ceeb, 200, 550);
+  // Sky dome
+  scene.background = null;
+  createSkyDome(isNight);
+  scene.fog = new THREE.Fog(isNight ? 0x0a0a1e : 0x87ceeb, isNight ? 150 : 200, isNight ? 500 : 550);
+
+  // Bloom tuning per track
+  if (bloomPass) {
+    bloomPass.strength = isNight ? 0.6 : 0.3;
+    bloomPass.threshold = isNight ? 0.7 : 0.85;
   }
+  renderer.toneMappingExposure = isNight ? 0.85 : 1.0;
 
   // Lights
   const ambLight = new THREE.AmbientLight(isNight ? 0x223344 : 0x667788, isNight ? 0.6 : 0.8);
@@ -448,8 +588,8 @@ function setupScene(trackIdx) {
   const dirLight = new THREE.DirectionalLight(isNight ? 0x6677aa : 0xffeedd, isNight ? 0.5 : 1.0);
   dirLight.position.set(50, 80, 30);
   dirLight.castShadow = true;
-  dirLight.shadow.mapSize.width = 2048;
-  dirLight.shadow.mapSize.height = 2048;
+  dirLight.shadow.mapSize.width = 1024;
+  dirLight.shadow.mapSize.height = 1024;
   dirLight.shadow.camera.near = 0.5;
   dirLight.shadow.camera.far = 300;
   dirLight.shadow.camera.left = -200;
@@ -458,25 +598,60 @@ function setupScene(trackIdx) {
   dirLight.shadow.camera.bottom = -200;
   scene.add(dirLight);
 
-  if (isNight) {
-    const hemiLight = new THREE.HemisphereLight(0x112244, 0x001122, 0.4);
-    scene.add(hemiLight);
-  }
+  // Hemisphere light for both tracks
+  const hemiLight = new THREE.HemisphereLight(
+    isNight ? 0x112244 : 0x88bbff,
+    isNight ? 0x001122 : 0x445522,
+    isNight ? 0.5 : 0.4
+  );
+  scene.add(hemiLight);
 
-  // Ground
+  // Fill light from opposite side
+  const fillLight = new THREE.DirectionalLight(isNight ? 0x6688cc : 0x8899bb, isNight ? 0.2 : 0.25);
+  fillLight.position.set(-30, 40, -20);
+  scene.add(fillLight);
+
+  // Ground with procedural grass texture
   const groundGeom = new THREE.PlaneGeometry(1000, 1000);
-  const groundMat = new THREE.MeshLambertMaterial({ color: isNight ? 0x0e200e : 0x3aad40 });
+  const grassTex = createGrassTexture(isNight);
+  const groundMat = new THREE.MeshStandardMaterial({
+    map: grassTex,
+    color: isNight ? 0x0e200e : 0x3aad40,
+    roughness: 0.95,
+    metalness: 0.0
+  });
   const ground = new THREE.Mesh(groundGeom, groundMat);
   ground.rotation.x = -Math.PI / 2;
   ground.position.y = -0.1;
   ground.receiveShadow = true;
   scene.add(ground);
 
+  // Water plane for Sunset Bay
+  if (trackIdx === 0) {
+    const waterGeom = new THREE.PlaneGeometry(500, 400);
+    const waterMat = new THREE.MeshStandardMaterial({
+      color: 0x006699,
+      roughness: 0.05,
+      metalness: 0.3,
+      transparent: true,
+      opacity: 0.55,
+      side: THREE.DoubleSide
+    });
+    waterMesh = new THREE.Mesh(waterGeom, waterMat);
+    waterMesh.rotation.x = -Math.PI / 2;
+    waterMesh.position.set(-80, -0.6, -280);
+    waterMesh.receiveShadow = true;
+    scene.add(waterMesh);
+  }
+
   // Build track
   buildTrack(trackIdx);
 
   // Scenery
   placeScenery(isNight);
+
+  // Clouds
+  createClouds(isNight);
 
   // Item boxes
   placeItemBoxes(trackIdx);
@@ -551,7 +726,11 @@ function buildTrack(trackIdx) {
   roadGeom.setIndex(roadIdx);
 
   const isNight = trackIdx === 1;
-  const roadMat = new THREE.MeshLambertMaterial({ color: isNight ? 0x2a2a3e : 0x3a3a42 });
+  const roadMat = new THREE.MeshStandardMaterial({
+    color: isNight ? 0x2a2a3e : 0x3a3a42,
+    roughness: isNight ? 0.3 : 0.75,
+    metalness: isNight ? 0.05 : 0.0
+  });
   const road = new THREE.Mesh(roadGeom, roadMat);
   road.receiveShadow = true;
   scene.add(road);
@@ -587,8 +766,8 @@ function buildTrack(trackIdx) {
   edgeGeom.setIndex(edgeLineIdx);
   edgeGeom.computeVertexNormals();
   const edgeMat = isNight
-    ? new THREE.MeshBasicMaterial({ color: 0x66ddff })
-    : new THREE.MeshBasicMaterial({ color: 0xffffff });
+    ? new THREE.MeshStandardMaterial({ color: 0x66ddff, emissive: 0x66ddff, emissiveIntensity: 0.5, roughness: 0.3, metalness: 0.0 })
+    : new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0.0 });
   scene.add(new THREE.Mesh(edgeGeom, edgeMat));
 
   // Red-white striped curbs
@@ -633,7 +812,6 @@ function buildTrack(trackIdx) {
         p.y + 0.75,
         p.z + right.z * side * dist
       );
-      post.castShadow = true;
       scene.add(post);
     }
   }
@@ -666,7 +844,7 @@ function buildTrack(trackIdx) {
     scene.add(stripe);
   }
   // Start gate arch
-  const archMat = new THREE.MeshLambertMaterial({ color: 0xee2222 });
+  const archMat = new THREE.MeshStandardMaterial({ color: 0xee2222, roughness: 0.4, metalness: 0.6 });
   const pillarGeom = new THREE.BoxGeometry(0.8, 6, 0.8);
   for (let side = -1; side <= 1; side += 2) {
     const pillar = new THREE.Mesh(pillarGeom, archMat);
@@ -690,7 +868,7 @@ function buildTrack(trackIdx) {
     const p1 = trackPoints[i];
     const p2 = trackPoints[(i + 2) % TRACK_SAMPLES];
     const dashGeom = new THREE.PlaneGeometry(0.9, 3.0);
-    const dashMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
+    const dashMat = new THREE.MeshStandardMaterial({ color: 0xffcc00, emissive: 0xffcc00, emissiveIntensity: 0.15, roughness: 0.5, metalness: 0.0 });
     const dash = new THREE.Mesh(dashGeom, dashMat);
     const mx = (p1.x + p2.x) / 2, mz = (p1.z + p2.z) / 2, my = (p1.y + p2.y) / 2;
     dash.position.set(mx, my + 0.03, mz);
@@ -702,7 +880,7 @@ function buildTrack(trackIdx) {
 
   // Corner arrow signs at sharp turns
   const signGeom = new THREE.PlaneGeometry(2.5, 2.5);
-  const signMat = new THREE.MeshBasicMaterial({ color: 0xffdd00, side: THREE.DoubleSide });
+  const signMat = new THREE.MeshStandardMaterial({ color: 0xffdd00, emissive: 0xffdd00, emissiveIntensity: 0.2, roughness: 0.5, metalness: 0.0, side: THREE.DoubleSide });
   for (let i = 0; i < TRACK_SAMPLES; i += 3) {
     const i2 = (i + 6) % TRACK_SAMPLES;
     const t1 = trackTangents[i];
@@ -778,10 +956,14 @@ function buildTrack(trackIdx) {
 
     // Glowing strip on road
     const padGeom = new THREE.PlaneGeometry(ROAD_WIDTH * 0.8, 3);
-    const padMat = new THREE.MeshBasicMaterial({
+    const padMat = new THREE.MeshStandardMaterial({
       color: 0x00ffff,
+      emissive: 0x00ffff,
+      emissiveIntensity: 0.8,
       transparent: true,
       opacity: 0.6,
+      roughness: 0.2,
+      metalness: 0.0,
       side: THREE.DoubleSide
     });
     const pad = new THREE.Mesh(padGeom, padMat);
@@ -793,7 +975,7 @@ function buildTrack(trackIdx) {
     // Arrow markers on boost pad
     for (let a = -1; a <= 1; a++) {
       const arrowGeom = new THREE.ConeGeometry(0.4, 1.2, 3);
-      const arrowMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+      const arrowMat = new THREE.MeshStandardMaterial({ color: 0x00ffff, emissive: 0x00ffff, emissiveIntensity: 0.8, roughness: 0.2, metalness: 0.0 });
       const arrow = new THREE.Mesh(arrowGeom, arrowMat);
       arrow.position.set(
         p.x + right.x * a * 2.5,
@@ -842,10 +1024,12 @@ function buildTrack(trackIdx) {
     rampGeom.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
     rampGeom.computeVertexNormals();
 
-    const rampMat = new THREE.MeshPhongMaterial({
+    const rampMat = new THREE.MeshStandardMaterial({
       color: 0xff8800,
       emissive: 0xff4400,
-      emissiveIntensity: 0.3
+      emissiveIntensity: 0.3,
+      roughness: 0.4,
+      metalness: 0.5
     });
     const ramp = new THREE.Mesh(rampGeom, rampMat);
     ramp.castShadow = true;
@@ -854,7 +1038,7 @@ function buildTrack(trackIdx) {
 
     // Chevron stripes on ramp
     const stripeGeom = new THREE.PlaneGeometry(rampW * 0.6, 0.3);
-    const stripeMat = new THREE.MeshBasicMaterial({ color: 0xffcc00, side: THREE.DoubleSide });
+    const stripeMat = new THREE.MeshStandardMaterial({ color: 0xffcc00, emissive: 0xffcc00, emissiveIntensity: 0.3, roughness: 0.4, metalness: 0.0, side: THREE.DoubleSide });
     for (let s = 0; s < 3; s++) {
       const stripe = new THREE.Mesh(stripeGeom, stripeMat);
       const progress = (s + 1) / 4;
@@ -870,16 +1054,31 @@ function buildTrack(trackIdx) {
 
 // ==================== SCENERY ====================
 function placeScenery(isNight) {
-  const treeGeom = new THREE.ConeGeometry(2.5, 7, 6);
-  const trunkGeom = new THREE.CylinderGeometry(0.5, 0.7, 3, 6);
-  const rockGeom = new THREE.IcosahedronGeometry(1.5, 0);
+  // Multi-layer tree geometries
+  const cone1Geom = new THREE.ConeGeometry(3.0, 4, 7);
+  const cone2Geom = new THREE.ConeGeometry(2.2, 3.5, 7);
+  const cone3Geom = new THREE.ConeGeometry(1.4, 3, 7);
+  const trunkGeom = new THREE.CylinderGeometry(0.4, 0.7, 3, 6);
+
+  // Irregular rock geometry
+  const rockGeom = new THREE.IcosahedronGeometry(1.5, 1);
+  const rockPos = rockGeom.attributes.position;
+  for (let v = 0; v < rockPos.count; v++) {
+    rockPos.setXYZ(v,
+      rockPos.getX(v) * (0.8 + Math.random() * 0.4),
+      rockPos.getY(v) * (0.8 + Math.random() * 0.4),
+      rockPos.getZ(v) * (0.8 + Math.random() * 0.4)
+    );
+  }
+  rockGeom.computeVertexNormals();
 
   const treeMat = new THREE.MeshLambertMaterial({ color: isNight ? 0x1a4a2a : 0x2d8a4e });
+  const treeMat2 = new THREE.MeshLambertMaterial({ color: isNight ? 0x163e24 : 0x257842 });
   const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5a3a1a });
   const rockMat = new THREE.MeshLambertMaterial({ color: isNight ? 0x445566 : 0x888888 });
 
-  // Place trees around track
-  for (let i = 0; i < TRACK_SAMPLES; i += 5) {
+  // Place trees around track (reduced density for performance)
+  for (let i = 0; i < TRACK_SAMPLES; i += 8) {
     const p = trackPoints[i];
     const t = trackTangents[i];
     const right = new THREE.Vector3().crossVectors(t, new THREE.Vector3(0, 1, 0)).normalize();
@@ -891,14 +1090,20 @@ function placeScenery(isNight) {
 
       if (Math.random() < 0.7) {
         const tree = new THREE.Group();
-        const leaves = new THREE.Mesh(treeGeom, treeMat);
-        leaves.position.y = 5;
-        leaves.castShadow = true;
-        tree.add(leaves);
         const trunk = new THREE.Mesh(trunkGeom, trunkMat);
         trunk.position.y = 1.5;
-        trunk.castShadow = true;
         tree.add(trunk);
+        // 3-layer foliage (only bottom layer casts shadow)
+        const layer1 = new THREE.Mesh(cone1Geom, treeMat);
+        layer1.position.y = 4;
+        layer1.castShadow = true;
+        tree.add(layer1);
+        const layer2 = new THREE.Mesh(cone2Geom, treeMat2);
+        layer2.position.y = 6;
+        tree.add(layer2);
+        const layer3 = new THREE.Mesh(cone3Geom, treeMat);
+        layer3.position.y = 7.8;
+        tree.add(layer3);
         tree.position.set(x, p.y, z);
         tree.scale.setScalar(0.7 + Math.random() * 0.6);
         scene.add(tree);
@@ -907,38 +1112,67 @@ function placeScenery(isNight) {
         rock.position.set(x, p.y + 0.5, z);
         rock.rotation.set(Math.random(), Math.random(), Math.random());
         rock.scale.setScalar(0.5 + Math.random() * 1.5);
-        rock.castShadow = true;
         scene.add(rock);
       }
     }
   }
 
-  // Neon lights for night track
+  // Neon lights for night track (reduced count for performance)
   if (isNight) {
     const neonColors = [0xff00ff, 0x00ffff, 0xff6600, 0x00ff66];
-    for (let i = 0; i < TRACK_SAMPLES; i += 15) {
+    const poleGeom = new THREE.CylinderGeometry(0.12, 0.12, 2.2, 4);
+    const glowGeom = new THREE.SphereGeometry(0.3, 6, 4);
+    // Shared materials per color
+    const neonMats = neonColors.map(c => new THREE.MeshBasicMaterial({ color: c }));
+    const glowMats = neonColors.map(c => new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.9 }));
+
+    for (let i = 0; i < TRACK_SAMPLES; i += 40) {
       const p = trackPoints[i];
       const t = trackTangents[i];
       const right = new THREE.Vector3().crossVectors(t, new THREE.Vector3(0, 1, 0)).normalize();
+      const colorIdx = (i / 40) % neonColors.length;
 
       for (let side = -1; side <= 1; side += 2) {
         const dist = ROAD_WIDTH / 2 + 3;
         const x = p.x + right.x * side * dist;
         const z = p.z + right.z * side * dist;
 
-        const light = new THREE.PointLight(neonColors[i % neonColors.length], 0.6, 25);
-        light.position.set(x, p.y + 2.5, z);
-        scene.add(light);
+        // Only every other pair gets a PointLight
+        if (i % 80 === 0) {
+          const light = new THREE.PointLight(neonColors[colorIdx], 1.0, 40);
+          light.position.set(x, p.y + 2.5, z);
+          scene.add(light);
+        }
 
-        const poleGeom = new THREE.CylinderGeometry(0.12, 0.12, 2.2, 4);
-        const poleMat = new THREE.MeshLambertMaterial({
-          color: neonColors[i % neonColors.length],
-          emissive: neonColors[i % neonColors.length],
-          emissiveIntensity: 0.6
-        });
-        const pole = new THREE.Mesh(poleGeom, poleMat);
+        const pole = new THREE.Mesh(poleGeom, neonMats[colorIdx]);
         pole.position.set(x, p.y + 1.1, z);
         scene.add(pole);
+
+        const glow = new THREE.Mesh(glowGeom, glowMats[colorIdx]);
+        glow.position.set(x, p.y + 2.3, z);
+        scene.add(glow);
+      }
+    }
+
+    // Poles without lights in between (visual only, no PointLight)
+    for (let i = 20; i < TRACK_SAMPLES; i += 40) {
+      const p = trackPoints[i];
+      const t = trackTangents[i];
+      const right = new THREE.Vector3().crossVectors(t, new THREE.Vector3(0, 1, 0)).normalize();
+      const colorIdx = ((i - 20) / 40) % neonColors.length;
+
+      for (let side = -1; side <= 1; side += 2) {
+        const dist = ROAD_WIDTH / 2 + 3;
+        const x = p.x + right.x * side * dist;
+        const z = p.z + right.z * side * dist;
+
+        const pole = new THREE.Mesh(poleGeom, neonMats[colorIdx]);
+        pole.position.set(x, p.y + 1.1, z);
+        scene.add(pole);
+
+        const glow = new THREE.Mesh(glowGeom, glowMats[colorIdx]);
+        glow.position.set(x, p.y + 2.3, z);
+        scene.add(glow);
       }
     }
   }
@@ -957,10 +1191,12 @@ function placeItemBoxes(trackIdx) {
     // Place 3 boxes across the track
     for (let j = -1; j <= 1; j++) {
       const offset = j * 5;
-      const boxMat = new THREE.MeshPhongMaterial({
+      const boxMat = new THREE.MeshStandardMaterial({
         color: 0xffaa00,
         emissive: 0xff6600,
-        emissiveIntensity: 0.3,
+        emissiveIntensity: 0.4,
+        roughness: 0.3,
+        metalness: 0.6,
         transparent: true,
         opacity: 0.8
       });
@@ -982,18 +1218,37 @@ function createKartMesh(charConfig) {
   const group = new THREE.Group();
   const color = charConfig.color;
 
+  // Metallic car paint material
+  const bodyMat = new THREE.MeshStandardMaterial({ color, roughness: 0.25, metalness: 0.75 });
+
   // Body
   const bodyGeom = new THREE.BoxGeometry(1.6, 0.45, 2.8);
-  const bodyMat = new THREE.MeshPhongMaterial({ color, shininess: 80 });
   const body = new THREE.Mesh(bodyGeom, bodyMat);
   body.position.y = 0.35;
   body.castShadow = true;
   group.add(body);
 
+  // Rounded top panel for aerodynamic look
+  const topGeom = new THREE.BoxGeometry(1.3, 0.12, 2.4);
+  const topMesh = new THREE.Mesh(topGeom, bodyMat);
+  topMesh.position.set(0, 0.58, -0.1);
+  topMesh.castShadow = true;
+  group.add(topMesh);
+
+  // Side skirts
+  const skirtMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.7, metalness: 0.2 });
+  const skirtGeom = new THREE.BoxGeometry(0.08, 0.2, 2.4);
+  for (let sx of [-0.8, 0.8]) {
+    const skirt = new THREE.Mesh(skirtGeom, skirtMat);
+    skirt.position.set(sx, 0.2, 0);
+    group.add(skirt);
+  }
+
   // Nose
   const noseGeom = new THREE.BoxGeometry(1.2, 0.3, 0.8);
   const nose = new THREE.Mesh(noseGeom, bodyMat);
   nose.position.set(0, 0.3, -1.5);
+  nose.castShadow = true;
   group.add(nose);
 
   // Spoiler
@@ -1009,49 +1264,56 @@ function createKartMesh(charConfig) {
   }
 
   // Cockpit
+  const cockpitMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6, metalness: 0.2 });
   const cockpitGeom = new THREE.BoxGeometry(1.2, 0.5, 1.0);
-  const cockpitMat = new THREE.MeshPhongMaterial({ color: 0x222222 });
   const cockpit = new THREE.Mesh(cockpitGeom, cockpitMat);
   cockpit.position.set(0, 0.65, 0.1);
   group.add(cockpit);
 
-  // Wheels
-  const wheelGeom = new THREE.CylinderGeometry(0.32, 0.32, 0.25, 8);
-  const wheelMat = new THREE.MeshPhongMaterial({ color: 0x222222 });
+  // Wheels with hubs
+  const wheelGeom = new THREE.CylinderGeometry(0.32, 0.32, 0.25, 12);
+  const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.9, metalness: 0.1 });
+  const hubGeom = new THREE.CylinderGeometry(0.15, 0.15, 0.26, 8);
+  const hubMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.2, metalness: 0.8 });
   const wheelPositions = [[-0.85, 0.22, -0.9], [0.85, 0.22, -0.9], [-0.85, 0.22, 0.85], [0.85, 0.22, 0.85]];
   group.userData.wheels = [];
   wheelPositions.forEach(([x, y, z]) => {
     const wheel = new THREE.Mesh(wheelGeom, wheelMat);
     wheel.position.set(x, y, z);
     wheel.rotation.z = Math.PI / 2;
+    wheel.castShadow = true;
     group.add(wheel);
+    const hub = new THREE.Mesh(hubGeom, hubMat);
+    hub.position.set(x, y, z);
+    hub.rotation.z = Math.PI / 2;
+    group.add(hub);
     group.userData.wheels.push(wheel);
   });
 
   // Character head
-  const headGeom = new THREE.SphereGeometry(0.32, 8, 8);
-  const headMat = new THREE.MeshPhongMaterial({ color: 0xffcc99 });
+  const headGeom = new THREE.SphereGeometry(0.32, 10, 10);
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xffcc99, roughness: 0.8, metalness: 0.0 });
   const head = new THREE.Mesh(headGeom, headMat);
   head.position.set(0, 1.1, 0.2);
   group.add(head);
 
   // Helmet
-  const helmetGeom = new THREE.SphereGeometry(0.35, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.6);
-  const helmetMat = new THREE.MeshPhongMaterial({ color, shininess: 100 });
+  const helmetGeom = new THREE.SphereGeometry(0.35, 10, 8, 0, Math.PI * 2, 0, Math.PI * 0.6);
+  const helmetMat = new THREE.MeshStandardMaterial({ color, roughness: 0.15, metalness: 0.5 });
   const helmet = new THREE.Mesh(helmetGeom, helmetMat);
   helmet.position.set(0, 1.15, 0.2);
   group.add(helmet);
 
   // Visor
   const visorGeom = new THREE.BoxGeometry(0.5, 0.15, 0.05);
-  const visorMat = new THREE.MeshPhongMaterial({ color: 0x333333, shininess: 120 });
+  const visorMat = new THREE.MeshStandardMaterial({ color: 0x222244, roughness: 0.05, metalness: 0.9 });
   const visor = new THREE.Mesh(visorGeom, visorMat);
   visor.position.set(0, 1.05, -0.15);
   group.add(visor);
 
   // Shield visual (initially invisible)
   const shieldGeom = new THREE.SphereGeometry(2.2, 16, 12);
-  const shieldMat = new THREE.MeshPhongMaterial({ color: 0x44aaff, transparent: true, opacity: 0, side: THREE.DoubleSide });
+  const shieldMat = new THREE.MeshStandardMaterial({ color: 0x44aaff, transparent: true, opacity: 0, roughness: 0.1, metalness: 0.3, side: THREE.DoubleSide });
   const shieldMesh = new THREE.Mesh(shieldGeom, shieldMat);
   shieldMesh.position.y = 0.5;
   group.add(shieldMesh);
@@ -1430,10 +1692,14 @@ function updateKartPhysics(kart, dt, input) {
 }
 
 // Dirt particles when off-road
+// Shared particle geometries for performance
+const _particleSmallGeom = new THREE.SphereGeometry(0.1, 4, 3);
+const _particleMedGeom = new THREE.SphereGeometry(0.12, 4, 3);
+const _particleLargeGeom = new THREE.SphereGeometry(0.18, 4, 3);
+
 function spawnDirtParticle(kart) {
-  const geom = new THREE.BoxGeometry(0.2, 0.2, 0.2);
-  const mat = new THREE.MeshBasicMaterial({ color: 0x886633 });
-  const p = new THREE.Mesh(geom, mat);
+  const mat = new THREE.MeshBasicMaterial({ color: 0x886633, transparent: true });
+  const p = new THREE.Mesh(_particleMedGeom, mat);
   p.position.copy(kart.position);
   p.position.y += 0.1;
   scene.add(p);
@@ -1745,10 +2011,12 @@ function useItem(kart) {
 
 function fireProjectile(kart, homing) {
   const projGeom = new THREE.SphereGeometry(0.5, 8, 6);
-  const projMat = new THREE.MeshPhongMaterial({
+  const projMat = new THREE.MeshStandardMaterial({
     color: homing ? 0xff3333 : 0x33ff33,
     emissive: homing ? 0xff0000 : 0x00ff00,
-    emissiveIntensity: 0.5
+    emissiveIntensity: 0.8,
+    roughness: 0.2,
+    metalness: 0.4
   });
   const proj = new THREE.Mesh(projGeom, projMat);
   proj.position.copy(kart.position);
@@ -1784,7 +2052,7 @@ function findNearestKartAhead(sourceKart) {
 
 function dropOilSlick(kart) {
   const oilGeom = new THREE.CylinderGeometry(1.5, 1.5, 0.1, 8);
-  const oilMat = new THREE.MeshPhongMaterial({ color: 0x222222, transparent: true, opacity: 0.7 });
+  const oilMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.05, metalness: 0.0, transparent: true, opacity: 0.7 });
   const oil = new THREE.Mesh(oilGeom, oilMat);
 
   const behind = new THREE.Vector3(Math.sin(kart.rotation), 0, Math.cos(kart.rotation));
@@ -1905,14 +2173,13 @@ function spawnDriftParticle(kart) {
   wheelOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), kart.rotation);
 
   let color;
-  if (kart.driftBoostStage >= 3) color = 0xff00ff; // black/purple stage 3
-  else if (kart.driftBoostStage >= 2) color = 0xff2222; // red stage 2
-  else if (kart.driftBoostStage >= 1) color = 0x4488ff; // blue stage 1
-  else color = 0xffff44; // default yellow
+  if (kart.driftBoostStage >= 3) color = 0xff00ff;
+  else if (kart.driftBoostStage >= 2) color = 0xff2222;
+  else if (kart.driftBoostStage >= 1) color = 0x4488ff;
+  else color = 0xffff44;
 
-  const sparkGeom = new THREE.BoxGeometry(0.15, 0.15, 0.15);
-  const sparkMat = new THREE.MeshBasicMaterial({ color });
-  const spark = new THREE.Mesh(sparkGeom, sparkMat);
+  const sparkMat = new THREE.MeshBasicMaterial({ color, transparent: true });
+  const spark = new THREE.Mesh(_particleSmallGeom, sparkMat);
   spark.position.copy(kart.position).add(wheelOffset);
   scene.add(spark);
 
@@ -1927,9 +2194,9 @@ function spawnDriftParticle(kart) {
 function spawnBoostParticle(kart) {
   const behind = new THREE.Vector3(Math.sin(kart.rotation) * 1.5, 0.3, Math.cos(kart.rotation) * 1.5);
 
-  const flameGeom = new THREE.BoxGeometry(0.2, 0.2, 0.2);
-  const flameMat = new THREE.MeshBasicMaterial({ color: Math.random() < 0.5 ? 0xff4400 : 0xffaa00 });
-  const flame = new THREE.Mesh(flameGeom, flameMat);
+  const flameColor = Math.random() < 0.5 ? 0xff4400 : 0xffaa00;
+  const flameMat = new THREE.MeshBasicMaterial({ color: flameColor, transparent: true });
+  const flame = new THREE.Mesh(_particleMedGeom, flameMat);
   flame.position.copy(kart.position).add(behind);
   scene.add(flame);
 
@@ -1947,9 +2214,9 @@ function spawnBoostParticle(kart) {
 
 function spawnExplosion(pos) {
   for (let i = 0; i < 20; i++) {
-    const geom = new THREE.BoxGeometry(0.3, 0.3, 0.3);
-    const mat = new THREE.MeshBasicMaterial({ color: Math.random() < 0.5 ? 0xff4400 : 0xffcc00 });
-    const p = new THREE.Mesh(geom, mat);
+    const expColor = Math.random() < 0.5 ? 0xff4400 : 0xffcc00;
+    const mat = new THREE.MeshBasicMaterial({ color: expColor, transparent: true });
+    const p = new THREE.Mesh(_particleLargeGeom, mat);
     p.position.copy(pos);
     scene.add(p);
 
@@ -2725,7 +2992,10 @@ function gameLoop() {
     updateCamera(dt);
   }
 
-  renderer.render(scene, camera);
+  // Animate water
+  if (waterMesh) waterMesh.position.y = -0.6 + Math.sin(Date.now() * 0.001) * 0.15;
+
+  composer.render();
 }
 
 // ==================== INPUT ====================
